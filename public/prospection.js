@@ -45,7 +45,6 @@
   let companies = [];
   let selectedKeys = new Set();
   let editedMails = {};
-  let eventSource = null;
 
   function loadSender() {
     try {
@@ -248,16 +247,58 @@
     }
   }
 
+  async function api(path, options) {
+    const response = await fetch(path, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    return data;
+  }
+
+  // Une requête par page BODACC puis une par entreprise : chaque appel au Worker reste sous sa limite de 50 sous-requêtes.
+  async function runSteps(query, options) {
+    const found = [];
+    const seen = new Set();
+    let total = 0;
+    let offset = 0;
+    while (offset !== null) {
+      const page = await api(`/api/prospection/page?${new URLSearchParams({ ...query, offset: String(offset) })}`);
+      total = page.total;
+      for (const company of page.companies) {
+        const key = company.siren || `${company.name}|${company.city}|${company.createdAt}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        found.push(company);
+      }
+      handleEvent({ type: "status", message: `BODACC : ${Math.min(page.nextOffset ?? total, total)} / ${total} annonces lues, ${found.length} entreprises retenues.` });
+      offset = page.nextOffset;
+    }
+    for (const [index, raw] of found.entries()) {
+      handleEvent({ type: "status", message: `(${index + 1}/${found.length}) Recherche — ${raw.name}` });
+      try {
+        const result = await api("/api/prospection/enrich", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ company: raw, ...options })
+        });
+        if (result.skipped) handleEvent({ type: "status", message: `Écartée (${result.skipped}) — ${raw.name}` });
+        else handleEvent({ type: options.enrichContacts ? "contact" : "company", company: result.company });
+      } catch (error) {
+        handleEvent({ type: "status", message: `Erreur pour ${raw.name} : ${error.message}` });
+      }
+    }
+    handleEvent({
+      type: "done",
+      companies,
+      summary: { found: companies.length, withContact: companies.filter((c) => c.hasContact).length, totalBodacc: total }
+    });
+  }
+
   function run() {
     saveSender();
     const sector = selectedSector();
     if (!sector) {
       log("Choisissez un secteur.");
       return;
-    }
-    if (eventSource) {
-      eventSource.close();
-      eventSource = null;
     }
     companies = [];
     selectedKeys.clear();
@@ -266,31 +307,21 @@
     statsBox.innerHTML = "";
     logBox.textContent = "";
     runBtn.disabled = true;
-    const params = new URLSearchParams({
+    const query = {
       sector,
       days: daysSelect.value,
-      limit: "9999",
       department: departmentInput.value.trim(),
-      cities: citiesInput.value.trim(),
-      hideHome: hideHomeCb.checked ? "1" : "0",
+      cities: citiesInput.value.trim()
+    };
+    const options = {
+      hideHome: hideHomeCb.checked,
+      enrichContacts: true,
       senderName: senderName.value.trim(),
       senderEmail: senderEmail.value.trim(),
       senderPhone: senderPhone.value.trim()
-    });
+    };
     log(`D\u00e9marrage \u2014 secteur \u00ab ${sector} \u00bb.`);
-    eventSource = new EventSource(`/api/prospection/stream?${params.toString()}`);
-    eventSource.onmessage = (message) => {
-      try {
-        handleEvent(JSON.parse(message.data));
-      } catch (error) {
-        log(`\u00c9v\u00e9nement illisible : ${error instanceof Error ? error.message : "inconnue"}`);
-      }
-    };
-    eventSource.onerror = () => {
-      if (runBtn.disabled) log("Connexion interrompue. Relancez si la liste est incompl\u00e8te.");
-      runBtn.disabled = false;
-      eventSource.close();
-    };
+    runSteps(query, options).catch((error) => handleEvent({ type: "error", message: error.message }));
   }
 
   function exportCsv() {

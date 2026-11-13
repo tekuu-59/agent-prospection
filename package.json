@@ -1,15 +1,10 @@
 {
   "name": "agent-prospection-signaletique",
   "version": "1.0.0",
+  "private": true,
   "description": "Agent de prospection des nouvelles entreprises pour la signalétique",
-  "main": "server/index.js",
   "scripts": {
-    "start": "node server/index.js",
+    "dev": "npx wrangler dev",
     "test": "node --test server/prospection-agent.test.js"
-  },
-  "engines": { "node": ">=18" },
-  "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^5.2.1"
   }
 }

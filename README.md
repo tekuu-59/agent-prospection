@@ -27,8 +27,7 @@ Pour en écarter d'autres, ajoutez un mot-clé à `NO_SIGNAGE_ACTIVITY` ou un co
 ## Utilisation
 
 ```
-npm install
-npm start          # http://localhost:3000/prospection
+npm run dev        # http://localhost:8787 (moteur Cloudflare en local)
 npm test
 ```
 
@@ -38,6 +37,9 @@ npm test
 
 Sources gratuites, sans clé API : BODACC, API Recherche d'entreprises, OpenStreetMap, PagesJaunes, Brave Search, societe.com.
 
-## Déploiement
+## Déploiement (Cloudflare Workers)
 
-`render.yaml` est prêt pour [Render](https://render.com) (offre gratuite, Node).
+Cloudflare > Workers & Pages > Créer > Importer un dépôt GitHub, sans commande de build. Le nom du Worker doit être celui de `wrangler.jsonc` (`agent-prospection`).
+
+- `worker.js` : routes `/api/prospection/page` (une page BODACC) et `/api/prospection/enrich` (une entreprise) ; le reste sert `public/`.
+- C'est la page qui enchaîne les appels, car l'offre gratuite limite chaque appel à 50 requêtes sortantes. Si une entreprise les dépasse, ses dernières sources de contact sont sautées.

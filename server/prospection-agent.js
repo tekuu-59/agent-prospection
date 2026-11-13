@@ -6,9 +6,7 @@
  * - Brave Search + PagesJaunes via le lecteur Jina (gratuit) : contacts publics
  */
 
-const dns = require("dns").promises;
-const express = require("express");
-
+const DOH_URL = "https://cloudflare-dns.com/dns-query";
 const USER_AGENT = "Agent-Prospection-Signaletique/1.0";
 const BODACC_URL = "https://bodacc-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/annonces-commerciales/records";
 const SIRENE_URL = "https://recherche-entreprises.api.gouv.fr/search";
@@ -599,6 +597,20 @@ async function fetchWithTimeout(url, options = {}) {
   throw lastError || new Error(`Échec de récupération: ${url}`);
 }
 
+// DNS-over-HTTPS : marche dans un Worker comme dans Node, sans module dns.
+async function dnsHas(name, type) {
+  try {
+    const data = await fetchJson(`${DOH_URL}?${new URLSearchParams({ name, type })}`, {
+      timeoutMs: 5000,
+      retries: 0,
+      accept: "application/dns-json"
+    });
+    return (data.Answer || []).some((answer) => answer.type === (type === "MX" ? 15 : 1));
+  } catch {
+    return false;
+  }
+}
+
 async function fetchJson(url, options = {}) {
   const response = await fetchWithTimeout(url, options);
   if (!response.ok) {
@@ -649,40 +661,33 @@ function buildBodaccWhere(sector, days, department, cities = []) {
   return clauses.join(" AND ");
 }
 
-async function fetchBodaccCreations(sector, days, department, needed, cities = []) {
-  const where = buildBodaccWhere(sector, days, department, cities);
-  const collected = [];
-  const seen = new Set();
-  let offset = 0;
-  let total = Infinity;
-  while (collected.length < needed * 3 && offset < total && offset < 2000) {
-    const url = `${BODACC_URL}?${new URLSearchParams({
-      where,
-      limit: String(BODACC_PAGE_SIZE),
-      offset: String(offset),
-      order_by: "dateparution desc"
-    }).toString()}`;
-    const payload = await fetchJson(url, { timeoutMs: 25000 });
-    total = Number(payload.total_count || 0);
-    const rows = payload.results || [];
-    if (!rows.length) break;
-    for (const row of rows) {
-      const company = parseBodaccRecord(row);
-      if (!company.name || !company.activity) continue;
-      if (!activityMatchesSector(company.activity, sector)) continue;
-      if (!needsSignage(company)) continue;
-      if (!cityMatches(company, cities)) continue;
-      const key = company.siren || `${company.name}|${company.city}|${company.createdAt}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      collected.push(company);
-      if (collected.length >= needed * 3) break;
-    }
-    offset += rows.length;
-    if (rows.length < BODACC_PAGE_SIZE) break;
-    await sleep(200);
-  }
-  return { total, companies: collected };
+// Une page BODACC par appel : la page web enchaîne les offsets (limite de sous-requêtes des Workers).
+async function fetchBodaccPage(params = {}) {
+  const sector = resolveSector(params.sector);
+  if (!sector) throw new Error("Choisissez un secteur d'activité.");
+  const days = Math.min(180, Math.max(7, Number(params.days) || 30));
+  const department = String(params.department || "").replace(/\D/g, "").slice(0, 3);
+  const cities = parseCities(params.cities);
+  const offset = Math.max(0, Math.floor(Number(params.offset) || 0));
+  const url = `${BODACC_URL}?${new URLSearchParams({
+    where: buildBodaccWhere(sector, days, department, cities),
+    limit: String(BODACC_PAGE_SIZE),
+    offset: String(offset),
+    order_by: "dateparution desc"
+  }).toString()}`;
+  const payload = await fetchJson(url, { timeoutMs: 25000 });
+  const total = Number(payload.total_count || 0);
+  const rows = payload.results || [];
+  const companies = rows
+    .map(parseBodaccRecord)
+    .filter((company) => company.name && company.activity
+      && activityMatchesSector(company.activity, sector)
+      && needsSignage(company)
+      && cityMatches(company, cities));
+  const next = offset + rows.length;
+  // shortcut: 2000 annonces lues au plus par recherche, préciser ville/département au-delà.
+  const nextOffset = rows.length === BODACC_PAGE_SIZE && next < Math.min(total, 2000) ? next : null;
+  return { total, nextOffset, companies };
 }
 
 function isNonDiffusible(value) {
@@ -798,11 +803,7 @@ async function enrichFromDomainGuess(company) {
   for (const form of unique) {
     for (const tld of [".fr", ".com"]) {
       const host = form + tld;
-      try {
-        await dns.lookup(host);
-      } catch {
-        continue;
-      }
+      if (!(await dnsHas(host, "A"))) continue;
       const url = `https://${host}`;
       try {
         const scraped = await scrapeWebsiteQuick(url, company);
@@ -988,12 +989,7 @@ async function enrichFromEmailGuess(company) {
     if (form.length < 3) continue;
     for (const tld of tlds) {
       const domain = form + tld;
-      try {
-        const mx = await dns.resolveMx(domain);
-        if (!mx || !mx.length) continue;
-      } catch {
-        continue;
-      }
+      if (!(await dnsHas(domain, "MX"))) continue;
       const prefixes = ["contact", "info", "hello", "bonjour"];
       for (const prefix of prefixes) {
         const email = `${prefix}@${domain}`;
@@ -1160,146 +1156,55 @@ function publicCompany(company, sender) {
   };
 }
 
-async function runProspection(params = {}, onEvent = () => {}) {
-  const sector = resolveSector(params.sector);
-  if (!sector) {
-    throw new Error("Choisissez un secteur d'activité.");
+async function findContacts(company) {
+  if (isGenericCompanyName(company)) return;
+  const steps = [
+    enrichFromEmailGuess, enrichFromNominatim, enrichFromDomainGuess, enrichFromPagesJaunes,
+    enrichFromSearch, enrichFromSociete, enrichFromDirectorSearch
+  ];
+  for (const step of steps) {
+    if (company.email || company.phone) return;
+    // Au-delà de 50 sous-requêtes (Workers gratuit), fetch échoue : les étapes suivantes renvoient « rien trouvé ».
+    await step(company);
+    await sleep(250);
   }
-  const days = Math.min(180, Math.max(7, Number(params.days) || 30));
-  const limit = Math.max(3, Number(params.limit) || 200);
-  const department = String(params.department || "").replace(/\D/g, "").slice(0, 3);
+}
+
+// Une entreprise par appel : Sirene, filtres, puis recherche de contacts.
+async function enrichCompany(body = {}) {
+  const raw = body.company;
+  if (!raw || typeof raw !== "object" || typeof raw.name !== "string" || !raw.name.trim()) {
+    throw new Error("Entreprise manquante.");
+  }
+  const text = (value) => String(value || "").slice(0, 2000);
+  const company = {
+    ...parseBodaccRecord({}),
+    name: text(raw.name), brandName: text(raw.brandName), legalName: text(raw.legalName),
+    activity: text(raw.activity), siren: String(raw.siren || "").replace(/\D/g, "").slice(0, 9),
+    createdAt: text(raw.createdAt), publishedAt: text(raw.publishedAt), address: text(raw.address),
+    city: text(raw.city), postalCode: text(raw.postalCode), department: text(raw.department),
+    directors: Array.isArray(raw.directors) ? raw.directors.slice(0, 5).map(text) : [],
+    addressExtra: text(raw.addressExtra), isPerson: Boolean(raw.isPerson), bodaccUrl: text(raw.bodaccUrl)
+  };
   const sender = {
-    name: String(params.senderName || "").trim(),
-    email: String(params.senderEmail || "").trim(),
-    phone: String(params.senderPhone || "").trim()
+    name: text(body.senderName).trim(),
+    email: text(body.senderEmail).trim(),
+    phone: text(body.senderPhone).trim()
   };
-  const enrichContacts = params.enrichContacts !== false;
-  const cities = parseCities(params.cities);
-  const hideHome = Boolean(params.hideHome);
-
-  onEvent({ type: "status", message: `Recherche BODACC — créations ${sector.label}, ${days} derniers jours${cities.length ? `, ${cities.join(", ")}` : ""}.` });
-  const { total, companies } = await fetchBodaccCreations(sector, days, department, limit, cities);
-  onEvent({ type: "status", message: `${total} annonces brutes, ${companies.length} entreprises du secteur.` });
-
-  const selected = [];
-  for (const company of companies) {
-    if (selected.length >= limit) break;
-    onEvent({ type: "status", message: `Enrichissement SIRENE — ${company.name}` });
-    await enrichSirene(company);
-    await sleep(180);
-    if (!needsSignage(company)) {
-      onEvent({ type: "status", message: `Écartée (pas de besoin de signalétique) — ${company.name}` });
-      continue;
-    }
-    const place = addressKind(company);
-    if (hideHome && (place.kind === "domicile" || place.kind === "domiciliation")) {
-      onEvent({ type: "status", message: `Écartée (${place.kind} : ${place.reason}) — ${company.name}` });
-      continue;
-    }
-    selected.push(company);
-    onEvent({ type: "company", company: publicCompany(company, sender) });
+  await enrichSirene(company);
+  if (!needsSignage(company)) return { skipped: "pas de besoin de signalétique" };
+  const place = addressKind(company);
+  if (body.hideHome && (place.kind === "domicile" || place.kind === "domiciliation")) {
+    return { skipped: `${place.kind} : ${place.reason}` };
   }
-
-  if (enrichContacts) {
-    for (const company of selected) {
-      onEvent({ type: "status", message: `Recherche de contact — ${company.name}` });
-      if (!isGenericCompanyName(company)) {
-        await enrichFromEmailGuess(company);
-        if (!company.email && !company.phone) {
-          await enrichFromNominatim(company);
-          await sleep(250);
-        }
-        if (!company.email && !company.phone) {
-          await enrichFromDomainGuess(company);
-        }
-        if (!company.email && !company.phone) {
-          await enrichFromPagesJaunes(company);
-          await sleep(400);
-        }
-        if (!company.email && !company.phone) {
-          await enrichFromSearch(company);
-          await sleep(400);
-        }
-        if (!company.email && !company.phone) {
-          await enrichFromSociete(company);
-          await sleep(400);
-        }
-        if (!company.email && !company.phone) {
-          await enrichFromDirectorSearch(company);
-          await sleep(400);
-        }
-      }
-      onEvent({ type: "contact", siren: company.siren, company: publicCompany(company, sender) });
-    }
-  }
-
-  const results = selected.map((company) => publicCompany(company, sender));
-  const withContact = results.filter((row) => row.hasContact).length;
-  const summary = {
-    sector: { id: sector.id, label: sector.label },
-    days,
-    department: department || null,
-    totalBodacc: total,
-    found: results.length,
-    withContact,
-    sources: ["BODACC DILA (gratuit)", "API Recherche d'entreprises (gratuit)", "OpenStreetMap Nominatim (gratuit)", "Brave Search + Google + PagesJaunes via Jina Reader (gratuit)", "Societe.com (gratuit)", "Devinette email MX (gratuit)", "Recherche dirigeant (gratuit)"]
-  };
-  onEvent({ type: "done", summary, companies: results });
-  return { summary, companies: results };
-}
-
-function writeSse(res, payload) {
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  if (typeof res.flush === "function") res.flush();
-}
-
-function createProspectionRouter() {
-  const router = express.Router();
-
-  router.get("/sectors", (_req, res) => {
-    res.json({ sectors: listSectors() });
-  });
-
-  router.post("/search", async (req, res) => {
-    try {
-      const result = await runProspection(req.body || {});
-      res.json(result);
-    } catch (error) {
-      res.status(400).json({ error: error instanceof Error ? error.message : "Recherche impossible" });
-    }
-  });
-
-  router.get("/stream", async (req, res) => {
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders?.();
-    try {
-      await runProspection({
-        sector: req.query.sector,
-        days: req.query.days,
-        limit: req.query.limit,
-        department: req.query.department,
-        cities: req.query.cities,
-        hideHome: req.query.hideHome === "1",
-        senderName: req.query.senderName,
-        senderEmail: req.query.senderEmail,
-        senderPhone: req.query.senderPhone,
-        enrichContacts: req.query.enrichContacts !== "0"
-      }, (event) => writeSse(res, event));
-    } catch (error) {
-      writeSse(res, { type: "error", message: error instanceof Error ? error.message : "Recherche impossible" });
-    }
-    res.end();
-  });
-
-  return router;
+  if (body.enrichContacts !== false) await findContacts(company);
+  return { company: publicCompany(company, sender) };
 }
 
 module.exports = {
   SECTORS,
-  createProspectionRouter,
-  runProspection,
+  fetchBodaccPage,
+  enrichCompany,
   listSectors,
   resolveSector,
   parseBodaccRecord,
